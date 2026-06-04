@@ -1,0 +1,11 @@
+.venv
+.vscode
+__pycache__
+
+data/
+images/
+matched_images/
+scripts/
+web/
+
+notes.md
