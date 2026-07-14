@@ -187,11 +187,9 @@ def closest_point_to_origin(line):
 
 
 class TriangulationPipeline:
-    '''
-    3d 
-    '''
     def __init__(self, image_data: ImageData):
         self.image_data = image_data
+        self.corrected_points = None
     
 
     def _corrected_correspondences(self, x1, y1, x2, y2, F):
@@ -205,8 +203,8 @@ class TriangulationPipeline:
         ### x1, y1, x2, y2 = image_data.data[1, ]
         ### F = image_data.F
 
-        # 1. Define transformation matrices to map homog coords
-        #    (x1, x2, z1), (y1, y2, z2) to the origin
+        # 1. Define transformation matrices to map coords
+        #    (x1, y1), (x2, y2) to the origin
         T1 = np.array([
             [1, 0, -x1],
             [0, 1, -y1],
@@ -276,15 +274,35 @@ class TriangulationPipeline:
         hat_xp /= hat_xp[2]
 
         return hat_x, hat_xp
+
+    def _normalization_mat(self, points):
+        '''
+        Input: (x1, y1) <--> (x2, y2) a pair of corresponding points
+        Output: transformation matrix T which transforms points such that the
+            centroid of the points is at the origin and the RMS distance of the
+            points to the origin is sqrt(2) in each image.
+        '''
+        centroids = np.mean(points, axis=0)
+        rms = np.sqrt(np.mean((points - centroids) ** 2))
+        if rms == 0:
+            raise ValueError('All points are the same, cannot isotropically scale')
+        scale = np.sqrt(2) / rms
+        T = np.array([
+            [scale, 0, -scale * centroids[0]],
+            [0, scale, -scale * centroids[1]],
+            [0, 0, 1]
+        ])
+        return T
+
     
     def _linear_triangulation(self, x1, y1, x2, y2, P1, P2):
         '''
-        Input: (Corrected) image points x=(x1,y1,z1) <--> xp=(x2,y2,z2) and
+        Normalized direct linear triangulation (DLT) algorithm
+        Input: (Corrected) image points x=(x1,y1) <--> xp=(x2,y2) and
                camera matrices P1, P2 s.t. x = P1 X, xp = P2 X for some unkown
-               world point X 
+               world point X. 
         Output: World point X
         '''
-
         # Setup equation to solve AX = 0 for X
         A = np.array([
             x1 * P1[2, ] - P1[0, ],
@@ -294,16 +312,18 @@ class TriangulationPipeline:
         ])
 
         # Solve for X
-        U, S, Vt = np.linalg.svd(A)
-        X = Vt[-1] # last col of V ie last row of Vt
+        _, _, Vt = np.linalg.svd(A)
+        X = Vt[-1] # we want last col of V, ie last row of V^T
 
-        # normalize homogeneous coordinates
+        # Normalize homogeneous coordinates
         X /= X[3]
         return X
 
     def triangulate(self):
         n = self.image_data.data.shape[0]
+        self.corrected_points = np.zeros(shape=(n, 4)) #x1,y1,x2,y2
         world_points = np.zeros(shape=(n, 4))
+
         for i, row in enumerate(self.image_data.data):
             # compute corrected correspondences
             hat_x, hat_xp = self._corrected_correspondences(
@@ -311,11 +331,26 @@ class TriangulationPipeline:
                 x2=row[2], y2=row[3],
                 F=self.image_data.F
             )
-            # compute world point
+            self.corrected_points[i, ] = [hat_x[0], hat_x[1], hat_xp[0], hat_xp[1]]
+        
+        # compute isotropic scaling matrices for the corrected points
+        T1 = self._normalization_mat(self.corrected_points[:, :2])
+        T2 = self._normalization_mat(self.corrected_points[:, 2:4])
+
+        # compute transformed camera matrices
+        P1 = T1 @ self.image_data.P1
+        P2 = T2 @ self.image_data.P2
+
+        # compute world points
+        for i, row in enumerate(self.corrected_points):
+            # normalize the (corrected) image points
+            hat_x = T1 @ np.array([row[0], row[1], 1])
+            hat_xp = T2 @ np.array([row[2], row[3], 1])
+            # DLT
             X = self._linear_triangulation(
                 x1=hat_x[0], y1=hat_x[1],
                 x2=hat_xp[0], y2=hat_xp[1],
-                P1=self.image_data.P1, P2=self.image_data.P2
+                P1=P1, P2=P2
             )
             world_points[i, :] = X
 
@@ -343,13 +378,8 @@ for i in range(data.shape[0]):
 ## Note: the corrected correspondences should satisfy the epipolar constraint
 ##  ~exactly, since they are optimized to do so.
 for i in range(data.shape[0]):
-    x_i = x[i, ]
-    xp_i = xp[i, ]
-    hat_x, hat_xp = pipeline._corrected_correspondences(
-        x1=x_i[0], y1=x_i[1],
-        x2=xp_i[0], y2=xp_i[1],
-        F=image_data.F
-    )
+    hat_x = pipeline.corrected_points[i, :2]
+    hat_xp = pipeline.corrected_points[i, 2:4]
     constraint = np.array([hat_xp[0], hat_xp[1], 1]).T @ image_data.F @ np.array([hat_x[0], hat_x[1], 1])
     print(f'Constraint for corrected point {i+1}: {constraint:.6f} (should be approx 0)')    
 
@@ -361,10 +391,12 @@ xp_reproj /= xp_reproj[:, 2:3]
 
 print(image_data.data[:, :2]) # original points in image 1
 print(x_reproj[:, :2])
-print(image_data.data[:, 2:4]) # original points in image 2
-print(xp_reproj[:, :2])
+# print(image_data.data[:, 2:4]) # original points in image 2
+# print(xp_reproj[:, :2])
 
 euclid = (world[:, :3].T / world[:, 3]).T
 np.savetxt(f"./data/{file}_reconstruction.csv",
            euclid, delimiter=',', header='X,Y,Z', comments='')
+np.savetxt(f"./data/{file}_corrected_correspondences.csv",
+           pipeline.corrected_points, delimiter=',', comments='')
 np.savez(f"./data/{file}_cameras.npz", P1=image_data.P1, P2=image_data.P2)
